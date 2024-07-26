@@ -17,13 +17,12 @@ Parameters:
   GitHubOAuthToken:
     Type: String
     Description: Github token 
-    NoEcho: true
   ContainerPort:
     Type: Number
     Default: 80
   LoadBalancerPort:
     Type: Number
-    Default: 443
+    Default: 80
   HealthCheckPath:
     Type: String
     Default: /
@@ -35,6 +34,14 @@ Parameters:
     Type: String
     # update with the name of the service
     Default: nest-ecr-repo
+  ContainerCpu:
+    Type: Number
+    Default: 256
+    Description: How much CPU to give the container. 1024 is 1 CPU
+  ContainerMemory:
+    Type: Number
+    Default: 512
+    Description: How much memory in megabytes to give the container\
 
 Resources:
   BackendECSTaskRole:
@@ -160,21 +167,14 @@ Resources:
       GroupDescription: security group for loadbalancer 
       VpcId: !Ref NestVpc
       SecurityGroupIngress:
-        - IpProtocol: tcp
-          FromPort: !Ref LoadBalancerPort
-          ToPort: !Ref LoadBalancerPort
-          CidrIp: 0.0.0.0/0
+        - CidrIp: 0.0.0.0/0
+          IpProtocol: -1
 
   ContainerSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
       GroupDescription: security group for conteiner 
       VpcId: !Ref NestVpc
-      SecurityGroupIngress:
-        - IpProtocol: tcp
-          FromPort: !Ref ContainerPort
-          ToPort: !Ref ContainerPort
-          SourceSecurityGroupId: !Ref LoadBalancerSecurityGroup
 
   # 1. Crear un Amazon Elastic Container Registry
   NestECRRepository:
@@ -192,7 +192,12 @@ Resources:
   NestTaskDefinition: 
     Type: AWS::ECS::TaskDefinition
     Properties:
-      Family: nest-task-definition
+      Family: !Ref ServiceName
+      Cpu: '256'
+      Memory: '512'
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
       ExecutionRoleArn: !GetAtt ECSTaskExecutionRole.Arn
       TaskRoleArn: !GetAtt BackendECSTaskRole.Arn 
       ContainerDefinitions:
@@ -201,11 +206,14 @@ Resources:
           PortMappings:
             - ContainerPort: !Ref ContainerPort
               HostPort: !Ref ContainerPort
-      RequiresCompatibilities:
-        - FARGATE
-      NetworkMode: awsvpc
-      Memory: '512'
-      Cpu: '256'
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              mode: non-blocking
+              max-buffer-size: 25m
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: !Ref ServiceName
 
   # 4. Crear un servicio dentro del cluster
   NestECSService: 
@@ -215,20 +223,18 @@ Resources:
     Properties:
       ServiceName: !Ref ServiceName 
       Cluster: !Ref NestECSCluster
-      TaskDefinition: !Ref NestTaskDefinition
       DeploymentConfiguration:
         MinimumHealthyPercent: 100
         MaximumPercent: 200
       DesiredCount: 0
-      LaunchType: FARGATE
+      TaskDefinition: !Ref NestTaskDefinition
       NetworkConfiguration:
         AwsvpcConfiguration:
-          AssignPublicIp: ENABLED
+          SecurityGroups:
+            - !Ref ContainerSecurityGroup
           Subnets:
             - !Ref PublicSubnet1
             - !Ref PublicSubnet2
-          SecurityGroups:
-            - !Ref ContainerSecurityGroup
       LoadBalancers:
         - ContainerName: !Ref ServiceName
           ContainerPort: !Ref ContainerPort
@@ -238,45 +244,45 @@ Resources:
     Type: AWS::ElasticLoadBalancingV2::TargetGroup
     Properties:
       HealthCheckIntervalSeconds: 10
-      # will look for a 200 status code by default unless specified otherwise
       HealthCheckPath: !Ref HealthCheckPath
+      Protocol: HTTP
       HealthCheckTimeoutSeconds: 5
       UnhealthyThresholdCount: 2
       HealthyThresholdCount: 2
       Name: TargetGroupToNestJS 
       Port: !Ref ContainerPort
-      Protocol: HTTP
       TargetGroupAttributes:
         - Key: deregistration_delay.timeout_seconds
           Value: 60 # default is 300
       TargetType: ip
       VpcId: !Ref NestVpc
 
-  ListenerHTTPS:
-    Type: AWS::ElasticLoadBalancingV2::Listener
-    Properties:
-      DefaultActions:
-        - TargetGroupArn: !Ref TargetGroup
-          Type: forward
-      LoadBalancerArn: !Ref LoadBalancer
-      Port: !Ref LoadBalancerPort
-      Protocol: HTTP
-
   LoadBalancer:
     Type: AWS::ElasticLoadBalancingV2::LoadBalancer
     Properties:
+      Scheme: internet-facing
       LoadBalancerAttributes:
-        # this is the default, but is specified here in case it needs to be changed
         - Key: idle_timeout.timeout_seconds
           Value: 60
       Name: LoadBalancerToNestAplication 
-      # "internal" is also an option
-      Scheme: internet-facing
       SecurityGroups:
         - !Ref LoadBalancerSecurityGroup
       Subnets:
         - !Ref PublicSubnet1
         - !Ref PublicSubnet2
+
+  ListenerHTTPS:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - Type: forward
+          ForwardConfig:
+            TargetGroups:
+              - TargetGroupArn: !Ref TargetGroup
+                Weight: 100
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: !Ref LoadBalancerPort
+      Protocol: HTTP
 
   ArtifactStoreBucket:
     Type: AWS::S3::Bucket
@@ -284,6 +290,14 @@ Resources:
       BucketName: !Sub ${AWS::StackName}-artifacts-${AWS::AccountId}
       VersioningConfiguration:
         Status: Enabled
+
+  ServiceIngressfromLoadBalancer:
+    Type: 'AWS::EC2::SecurityGroupIngress'
+    Properties:
+      Description: Ingress from the public ALB
+      GroupId: !Ref ContainerSecurityGroup
+      IpProtocol: -1
+      SourceSecurityGroupId: !Ref LoadBalancerSecurityGroup
 
   CodePipeline:
     Type: AWS::CodePipeline::Pipeline
@@ -440,5 +454,8 @@ Resources:
     Properties:
       SubnetId: !Ref PublicSubnet2
       RouteTableId: !Ref PublicRouteTable
+
+  LogGroup:
+    Type: 'AWS::Logs::LogGroup'
 
 # Nota: Necesitarás definir o referenciar los recursos ECSCluster y ECSService para el stage de Deploy
